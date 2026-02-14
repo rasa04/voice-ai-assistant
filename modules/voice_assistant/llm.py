@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import List, Dict
 
 from openai import OpenAI
-
 
 @dataclass
 class LLMConfig:
@@ -13,6 +13,9 @@ class LLMConfig:
     model: str
     temperature: float
     history_turns: int
+
+
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
 
 class LMStudioChat:
@@ -27,7 +30,8 @@ class LMStudioChat:
                 "role": "system",
                 "content": (
                     "Ты локальный голосовой ассистент. Отвечай по-русски, кратко и по делу. "
-                    "Если вопрос неоднозначный — уточни одним коротким вопросом."
+                    "Никогда не показывай скрытые рассуждения. "
+                    "НЕ используй теги <think> и не выводи размышления."
                 ),
             }
         ]
@@ -41,40 +45,35 @@ class LMStudioChat:
         self._trim()
 
     def reply(self) -> str:
-        # Streaming output to console; return full text for TTS.
-        out = []
+        # Для MVP делаем stream=False, чтобы гарантированно вырезать <think>
         try:
-            stream = self.client.chat.completions.create(
+            resp = self.client.chat.completions.create(
                 model=self.cfg.model,
                 messages=self.history,
                 temperature=self.cfg.temperature,
-                stream=True,
+                stream=False,
             )
-            for chunk in stream:
-                delta = chunk.choices[0].delta.content if chunk.choices else None
-                if not delta:
-                    continue
-                print(delta, end="", flush=True)
-                out.append(delta)
-            print("", flush=True)
         except Exception as e:  # noqa: BLE001
             raise RuntimeError(
                 f"LM Studio недоступен по {self.cfg.base_url}. "
-                f"Проверь что сервер запущен (lms server start) и модель загружена. "
-                f"Детали: {e}"
+                f"Проверь сервер: lms server start. Детали: {e}"
             ) from e
 
-        text = "".join(out).strip()
-        return self._cleanup_text(text)
+        text = resp.choices[0].message.content or ""
+        text = self._cleanup_text(text)
+
+        # печатаем уже очищенный текст
+        print(text, flush=True)
+        return text
 
     def _trim(self) -> None:
-        # keep system + last N turns (user+assistant pairs)
         keep = 1 + (self.cfg.history_turns * 2)
         if len(self.history) > keep:
             self.history = [self.history[0]] + self.history[-(keep - 1):]
 
     @staticmethod
     def _cleanup_text(text: str) -> str:
+        text = _THINK_RE.sub("", text)
         text = text.replace("\n", " ").strip()
         while "  " in text:
             text = text.replace("  ", " ")
