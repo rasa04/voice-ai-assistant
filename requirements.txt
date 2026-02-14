@@ -1,0 +1,5 @@
+openai>=1.0.0,<2
+numpy>=1.24
+sounddevice>=0.4.6
+webrtcvad-wheels>=2.0.14
+pywhispercpp>=1.4.1
