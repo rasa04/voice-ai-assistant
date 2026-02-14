@@ -12,6 +12,7 @@ class LLMConfig:
     api_key: str
     model: str
     temperature: float
+    timeout_s: float
     history_turns: int
 
 
@@ -24,12 +25,23 @@ class LMStudioChat:
     """
     def __init__(self, cfg: LLMConfig):
         self.cfg = cfg
-        self.client = OpenAI(base_url=cfg.base_url, api_key=cfg.api_key)
+        self.client = OpenAI(
+            base_url=cfg.base_url,
+            api_key=cfg.api_key,
+            timeout=cfg.timeout_s,
+        )
+        self._model_reported = False
         self.history: List[Dict[str, str]] = [
             {
                 "role": "system",
                 "content": (
                     "Ты локальный голосовой ассистент. Отвечай по-русски, кратко и по делу. "
+                    "Не используй эмодзи, смайлики и markdown-разметку. "
+                    f"Текущая языковая модель backend: {cfg.model}. "
+                    "Никогда не выдумывай название компании-разработчика, если не уверен. "
+                    "Если спрашивают «кто тебя разработал» или «какая ты модель», "
+                    "честно говори, что ты локальный ассистент, запущенный пользователем, "
+                    f"а LLM backend сейчас: {cfg.model} в LM Studio. "
                     "Никогда не показывай скрытые рассуждения. "
                     "НЕ используй теги <think> и не выводи размышления."
                 ),
@@ -58,6 +70,11 @@ class LMStudioChat:
                 f"LM Studio недоступен по {self.cfg.base_url}. "
                 f"Проверь сервер: lms server start. Детали: {e}"
             ) from e
+
+        remote_model = getattr(resp, "model", "") or self.cfg.model
+        if not self._model_reported:
+            print(f"[llm] Модель backend: {remote_model}", flush=True)
+            self._model_reported = True
 
         text = resp.choices[0].message.content or ""
         text = self._cleanup_text(text)

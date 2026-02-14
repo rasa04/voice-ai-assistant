@@ -94,3 +94,6 @@ class VADSegmenter:
         self.ring.clear()
         self._utt = bytearray()
         self._utt_frames = 0
+
+    def reset(self) -> None:
+        self._reset()
