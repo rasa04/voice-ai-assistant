@@ -47,10 +47,25 @@ class Config:
         True,
     )
 
-    # LLM (LM Studio OpenAI-compat)
+    # LLM
+    lm_backend: str = os.getenv("VA_LLM_BACKEND", "local")  # auto | local | lmstudio
     lm_base_url: str = os.getenv("LMSTUDIO_BASE_URL", "http://localhost:1234/v1")
     lm_api_key: str = os.getenv("LMSTUDIO_API_KEY", "lm-studio")
     lm_model: str = os.getenv("LMSTUDIO_MODEL", "qwen/qwen3-4b-2507")
+    lm_local_model_path: str = os.getenv(
+        "VA_LLM_MODEL_PATH",
+        ".cache/voice_assistant/models/llm/Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+    )
+    lm_local_model_url: str = os.getenv(
+        "VA_LLM_MODEL_URL",
+        "https://huggingface.co/bartowski/Qwen_Qwen3-4B-Instruct-2507-GGUF/resolve/main/Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+    )
+    lm_local_ctx: int = int(os.getenv("VA_LLM_CTX", "4096"))
+    lm_local_threads: int = int(os.getenv("VA_LLM_THREADS", "0"))  # 0 => auto
+    lm_local_gpu_layers: int = int(os.getenv("VA_LLM_GPU_LAYERS", "-1"))  # -1 => all
+    lm_local_max_tokens: int = int(os.getenv("VA_LLM_MAX_TOKENS", "384"))
+    lm_local_use_mmap: bool = _env_bool("VA_LLM_USE_MMAP", True)
+    lm_local_use_mlock: bool = _env_bool("VA_LLM_USE_MLOCK", False)
     lm_temperature: float = float(os.getenv("VA_LM_TEMPERATURE", "0.35"))
     lm_timeout_s: float = float(os.getenv("VA_LM_TIMEOUT_S", "45"))
     history_turns: int = int(os.getenv("VA_HISTORY_TURNS", "10"))
@@ -68,6 +83,11 @@ class Config:
         "VA_TTS_PIPER_MODEL",
         ".cache/voice_assistant/models/piper/ru_RU-irina-medium.onnx",
     )
+    tts_piper_model_url: str = os.getenv(
+        "VA_TTS_PIPER_MODEL_URL",
+        "https://huggingface.co/rhasspy/piper-voices/resolve/main/ru/ru_RU/irina/medium/ru_RU-irina-medium.onnx",
+    )
+    tts_piper_config_url: str = os.getenv("VA_TTS_PIPER_CONFIG_URL", "")
 
     # Misc
     cache_dir: str = os.getenv("VA_CACHE_DIR", ".cache/voice_assistant")

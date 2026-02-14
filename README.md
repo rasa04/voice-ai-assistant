@@ -1,71 +1,124 @@
-# VA (локальный голосовой ассистент)
+# VA (Local Voice Assistant)
 
-Локальный voice-agent на macOS:
-- STT: `whisper.cpp` (через `pywhispercpp`)
-- LLM: LM Studio (`OpenAI-compatible` endpoint)
-- TTS: локальный `Piper` (по умолчанию) или `macOS say`
+Offline-first voice assistant for macOS, Linux, and Windows.
 
-## One-click запуск на новом устройстве
+- STT: `whisper.cpp` via `pywhispercpp`
+- LLM: local `llama.cpp` by default, optional LM Studio fallback
+- TTS: local `Piper` by default (`say` is macOS-only fallback)
 
-1. Клонируй репозиторий.
-2. Запусти:
+## Quick Start (Source)
 
 ```bash
 ./run.sh
 ```
 
-`run.sh` автоматически:
-- создаст `.venv`
-- установит зависимости
-- подхватит `.env` (или создаст из `.env.example`)
-- для `Piper` докачает голосовую модель, если ее нет
+`run.sh` will automatically:
+- create `.venv`
+- install/update dependencies
+- create `.env` from `.env.example` on first run
+- download missing Piper voice assets
 
-## Текущие дефолты
+## Default Stack
 
-- LLM: `qwen/qwen3-4b-2507` (должна быть загружена в LM Studio)
+- LLM: `Qwen_Qwen3-4B-Instruct-2507-Q4_K_M.gguf` (auto-downloaded)
 - STT: `whisper.cpp/medium`
 - TTS: `piper` + `ru_RU-irina-medium.onnx`
 
-Все запускается локально на машине.
+## Portable Build For Friends (Recommended)
 
-## Перед запуском
+You should share ZIP artifacts from `dist/`, not raw build folders.
 
-1. Подними LM Studio сервер и загрузи нужную модель (например `qwen/qwen3-4b-2507`).
-2. Проверь, что endpoint доступен по `http://localhost:1234/v1`.
+- macOS artifact: `dist/va-assistant-macos.zip`
+- Linux artifact: `dist/va-assistant-linux.zip`
+- Windows artifact: `dist/va-assistant-windows.zip`
 
-## Полезные команды
+## Build For All OS (GitHub Actions)
 
-Список микрофонов:
+Use workflow `.github/workflows/build-binaries.yml`.
+
+1. Commit and push your branch.
+2. Open GitHub Actions.
+3. Run workflow `Build Binaries`.
+4. Download artifacts: `va-macOS`, `va-Linux`, `va-Windows`.
+
+This is the easiest way to generate all three platforms.
+
+## Local Build (venv required)
+
+If you build locally, create and use a virtual environment first.
+
+macOS/Linux:
+```bash
+cd /path/to/va
+python3 -m venv .venv
+./.venv/bin/python -m pip install -U pip
+./.venv/bin/python -m pip install -r requirements-build.txt
+./.venv/bin/python scripts/package.py --prefetch-assets
+```
+
+Windows (PowerShell):
+```powershell
+cd C:\path\to\va
+py -3.11 -m venv .venv
+.\.venv\Scripts\python -m pip install -U pip
+.\.venv\Scripts\python -m pip install -r requirements-build.txt
+.\.venv\Scripts\python .\scripts\package.py --prefetch-assets
+```
+
+## Packaging Options
+
+- `--prefetch-assets`: download missing LLM/TTS assets before build
+- `--onefile`: build one-file binary instead of one-dir app
+- `--skip-bundle-assets`: do not copy local model files into release ZIP
+
+Example:
+```bash
+./.venv/bin/python scripts/package.py --prefetch-assets --onefile
+```
+
+## What Gets Included In Release
+
+- assistant binary
+- `.env.example`
+- `README.md`
+- launcher scripts: `run.sh`, `run.bat`
+- local model assets (if present or prefetched)
+
+## Friend’s First Run
+
+1. Unzip the archive.
+2. Run `run.sh` (macOS/Linux) or `run.bat` (Windows).
+3. Wait for first-run model download if assets were not bundled.
+4. `.env` is created automatically from `.env.example`.
+
+LM Studio is not required in default mode (`VA_LLM_BACKEND=local`).
+
+## Useful Commands
+
+List input devices:
 ```bash
 VA_LIST_AUDIO_DEVICES=1 ./run.sh
 ```
 
-Если нужно выбрать устройство:
+Select input device:
 ```bash
 VA_INPUT_DEVICE=2 ./run.sh
 ```
-или укажи `VA_INPUT_DEVICE` в `.env`.
 
-## Настройка через `.env`
+## Environment Configuration
 
-Ключевые параметры:
-- `LMSTUDIO_MODEL` — модель LLM
-- `VA_WHISPER_MODEL` — модель STT (`small`, `medium`, ...)
-- `VA_TTS_BACKEND` — `piper` или `say`
-- `VA_TTS_PIPER_MODEL` — путь к `.onnx` модели голоса
-- `VA_TTS_PIPER_MODEL_URL` — URL для автодокачки модели
-- `VA_STT_NORMALIZE_TECH_TERMS=1` — нормализация тех-терминов (`php`, `c++`, `sql`, ...)
+Main parameters:
+- `VA_LLM_BACKEND`: `local`, `auto`, `lmstudio`
+- `VA_LLM_MODEL_PATH`: local `.gguf` model path
+- `VA_LLM_MODEL_URL`: `.gguf` auto-download URL
+- `VA_WHISPER_MODEL`: STT model (`base`, `small`, `medium`, ...)
+- `VA_TTS_BACKEND`: `piper` or `say` (macOS only)
+- `VA_TTS_PIPER_MODEL`: local `.onnx` voice model path
+- `VA_TTS_PIPER_MODEL_URL`: voice model URL
+- `VA_STT_NORMALIZE_TECH_TERMS=1`: normalize terms like `PHP`, `C++`, `SQL`
 
-## Fallback на `say` (если нужно)
+## Model Cache Paths
 
-В `.env`:
-```bash
-VA_TTS_BACKEND=say
-VA_TTS_VOICE=Milena
-VA_TTS_RATE=185
-```
-
-## Где хранятся модели
-
-- Piper TTS модель: `.cache/voice_assistant/models/piper/`
-- Whisper кэш: `~/Library/Application Support/pywhispercpp/models/`
+- Piper TTS: `.cache/voice_assistant/models/piper/`
+- LLM GGUF: `.cache/voice_assistant/models/llm/`
+- Whisper cache: OS user cache used by `pywhispercpp`

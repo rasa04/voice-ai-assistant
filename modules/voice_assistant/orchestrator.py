@@ -2,15 +2,21 @@ from __future__ import annotations
 
 import os
 import queue
+import shutil
+import ssl
+import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 
 from .audio_io import MicStream
 from .config import Config
+from .env_bootstrap import bootstrap_env, resolve_runtime_root
 from .vad import VADConfig, VADSegmenter
 from .stt import STTConfig, WhisperCppSTT, get_whisper_profile
-from .llm import LLMConfig, LMStudioChat
+from .llm import ChatLike, LLMConfig, build_chat
 from .tts import TTSConfig, TTSLike, build_tts
 
 
@@ -41,7 +47,7 @@ def _meta_answer(cmd: str, llm_model: str) -> str:
     ):
         return (
             f"Я локальный голосовой ассистент. Сейчас backend LLM: {llm_model} "
-            "через LM Studio. Запуск полностью локальный."
+            "Запуск локальный."
         )
 
     if any(
@@ -54,7 +60,7 @@ def _meta_answer(cmd: str, llm_model: str) -> str:
     ):
         return (
             "Это локальный ассистент в вашем проекте. "
-            f"Текущая языковая модель backend: {llm_model} (LM Studio). "
+            f"Текущая языковая модель backend: {llm_model}. "
             "Конкретного разработчика ассистента я не выдумываю."
         )
 
@@ -66,7 +72,7 @@ class AssistantWorker(threading.Thread):
         self,
         utter_q: "queue.Queue[Utterance]",
         stt: WhisperCppSTT,
-        llm: LMStudioChat,
+        llm: ChatLike,
         tts: TTSLike,
         stop_event: threading.Event,
         disable_tts: bool,
@@ -126,7 +132,7 @@ class AssistantWorker(threading.Thread):
                 self._last_norm_text = cmd
                 self._last_text_ts = now
 
-                meta = _meta_answer(cmd, self.llm.cfg.model)
+                meta = _meta_answer(cmd, self.llm.model_label)
                 if meta:
                     print("🤖  Ответ: ", end="", flush=True)
                     print(meta, flush=True)
@@ -148,7 +154,104 @@ class AssistantWorker(threading.Thread):
                 print(f"\n[worker error] {e}\n", flush=True)
 
 
+def _ensure_piper_assets(cfg: Config) -> None:
+    if (cfg.tts_backend or "").strip().lower() != "piper":
+        return
+
+    model_path = (cfg.tts_piper_model or "").strip()
+    if not model_path:
+        raise RuntimeError("Piper backend requires VA_TTS_PIPER_MODEL")
+
+    model_url = (cfg.tts_piper_model_url or "").strip()
+    config_url = (cfg.tts_piper_config_url or "").strip() or (f"{model_url}.json" if model_url else "")
+    config_path = f"{model_path}.json"
+
+    os.makedirs(os.path.dirname(model_path) or ".", exist_ok=True)
+
+    if not os.path.exists(model_path):
+        _download_file(model_url, model_path, "Piper voice model")
+
+    if not os.path.exists(config_path):
+        _download_file(config_url, config_path, "Piper voice config")
+
+
+def _download_file(url: str, dst_path: str, label: str) -> None:
+    if not url:
+        raise RuntimeError(f"{label} missing and download URL is empty.")
+
+    tmp_path = f"{dst_path}.tmp"
+    last_err: Exception | None = None
+
+    for attempt in range(1, 4):
+        try:
+            print(f"[tts] Downloading {label} (attempt {attempt}/3)...", flush=True)
+            ssl_ctx = _download_ssl_context()
+            with urllib.request.urlopen(url, timeout=120, context=ssl_ctx) as response, open(tmp_path, "wb") as out:
+                shutil.copyfileobj(response, out)
+            os.replace(tmp_path, dst_path)
+            return
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            if _is_ssl_error(e):
+                curl_ok, curl_err = _download_with_curl(url, tmp_path)
+                if curl_ok:
+                    os.replace(tmp_path, dst_path)
+                    return
+                last_err = RuntimeError(f"{e}; curl fallback failed: {curl_err}")  # noqa: TRY004
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
+            time.sleep(0.6 * attempt)
+
+    raise RuntimeError(f"Failed to download {label} from {url}: {last_err}") from last_err
+
+
+def _download_ssl_context() -> ssl.SSLContext:
+    ca_bundle = os.getenv("VA_DOWNLOAD_CA_BUNDLE", "").strip()
+    if ca_bundle:
+        return ssl.create_default_context(cafile=ca_bundle)
+
+    try:
+        import certifi  # type: ignore
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:  # noqa: BLE001
+        return ssl.create_default_context()
+
+
+def _is_ssl_error(err: Exception) -> bool:
+    if isinstance(err, ssl.SSLCertVerificationError):
+        return True
+    if isinstance(err, urllib.error.URLError):
+        reason = getattr(err, "reason", None)
+        if isinstance(reason, ssl.SSLCertVerificationError):
+            return True
+    return "CERTIFICATE_VERIFY_FAILED" in str(err).upper()
+
+
+def _download_with_curl(url: str, tmp_path: str) -> tuple[bool, str]:
+    curl_bin = shutil.which("curl")
+    if not curl_bin:
+        return False, "curl not found in PATH"
+
+    cmd = [curl_bin, "-L", "--fail", "--retry", "3", "-o", tmp_path, url]
+    ca_bundle = os.getenv("VA_DOWNLOAD_CA_BUNDLE", "").strip()
+    if ca_bundle:
+        cmd.extend(["--cacert", ca_bundle])
+
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        return True, ""
+    except Exception as e:  # noqa: BLE001
+        return False, str(e)
+
+
 def main() -> None:
+    runtime_root = resolve_runtime_root()
+    os.chdir(runtime_root)
+    bootstrap_env(runtime_root)
     cfg = Config()
     os.makedirs(cfg.cache_dir, exist_ok=True)
 
@@ -176,10 +279,20 @@ def main() -> None:
             f"strip_emoji={int(cfg.tts_strip_emoji)})"
         )
     )
+    llm_backend = (cfg.lm_backend or "auto").strip().lower()
+    if llm_backend in {"local", "llamacpp", "llama.cpp"}:
+        llm_target = f"{os.path.basename(cfg.lm_local_model_path)} (local llama.cpp)"
+    elif llm_backend in {"lmstudio", "openai"}:
+        llm_target = f"{cfg.lm_model} @ {cfg.lm_base_url}"
+    else:
+        llm_target = (
+            f"auto: local={os.path.basename(cfg.lm_local_model_path)} "
+            f"fallback={cfg.lm_model} @ {cfg.lm_base_url}"
+        )
 
     print(
         "\nКонфиг запуска:\n"
-        f"- LLM: {cfg.lm_model} @ {cfg.lm_base_url}\n"
+        f"- LLM: backend={llm_backend} target={llm_target}\n"
         f"- LLM timeout: {cfg.lm_timeout_s}s\n"
         f"- STT: whisper.cpp/{cfg.whisper_model} "
         f"lang={cfg.whisper_language} threads={cfg.whisper_threads} "
@@ -201,6 +314,12 @@ def main() -> None:
     )
     if disable_tts:
         print("[warn] Озвучка отключена: VA_DISABLE_TTS=1", flush=True)
+    else:
+        try:
+            _ensure_piper_assets(cfg)
+        except Exception as e:  # noqa: BLE001
+            print(f"\n[tts asset error]\n{e}\n", flush=True)
+            return
 
     frame_samples = int(cfg.sample_rate * (cfg.frame_ms / 1000.0))
 
@@ -246,16 +365,29 @@ def main() -> None:
         )
     )
 
-    llm = LMStudioChat(
-        LLMConfig(
-            base_url=cfg.lm_base_url,
-            api_key=cfg.lm_api_key,
-            model=cfg.lm_model,
-            temperature=cfg.lm_temperature,
-            timeout_s=cfg.lm_timeout_s,
-            history_turns=cfg.history_turns,
+    try:
+        llm = build_chat(
+            LLMConfig(
+                backend=cfg.lm_backend,
+                base_url=cfg.lm_base_url,
+                api_key=cfg.lm_api_key,
+                model=cfg.lm_model,
+                local_model_path=cfg.lm_local_model_path,
+                local_model_url=cfg.lm_local_model_url,
+                local_ctx=cfg.lm_local_ctx,
+                local_threads=cfg.lm_local_threads,
+                local_gpu_layers=cfg.lm_local_gpu_layers,
+                local_max_tokens=cfg.lm_local_max_tokens,
+                local_use_mmap=cfg.lm_local_use_mmap,
+                local_use_mlock=cfg.lm_local_use_mlock,
+                temperature=cfg.lm_temperature,
+                timeout_s=cfg.lm_timeout_s,
+                history_turns=cfg.history_turns,
+            )
         )
-    )
+    except Exception as e:  # noqa: BLE001
+        print(f"\n[llm error]\n{e}\n", flush=True)
+        return
 
     try:
         tts = build_tts(

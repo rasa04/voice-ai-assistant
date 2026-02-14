@@ -5,3 +5,4 @@ webrtcvad-wheels>=2.0.14
 pywhispercpp>=1.4.1
 piper-tts>=1.4.1
 pathvalidate>=3.3.1
+llama-cpp-python>=0.3.9

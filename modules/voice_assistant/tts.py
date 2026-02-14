@@ -7,8 +7,12 @@ import subprocess
 import sys
 import tempfile
 import threading
+import wave
 from dataclasses import dataclass
 from typing import Optional, Protocol
+
+import numpy as np
+import sounddevice as sd
 
 
 _SPACE_RE = re.compile(r"\s+")
@@ -41,6 +45,17 @@ class TTSConfig:
     piper_bin: str
     piper_model: str
     cache_dir: str
+
+
+class NullTTS:
+    def speak(self, text: str) -> None:  # noqa: ARG002
+        return
+
+    def stop(self) -> None:
+        return
+
+    def is_speaking(self) -> bool:
+        return False
 
 
 class MacSayTTS:
@@ -120,32 +135,36 @@ class MacSayTTS:
 
 class PiperTTS:
     """
-    Local neural TTS via external `piper` binary + `afplay`.
+    Local neural TTS via external `piper` binary + sounddevice playback.
     """
 
     def __init__(self, cfg: TTSConfig):
         self.cfg = cfg
         self._lock = threading.Lock()
         self._piper_proc: Optional[subprocess.Popen] = None
-        self._player_proc: Optional[subprocess.Popen] = None
         self._worker: Optional[threading.Thread] = None
+        self._is_playing = False
         self._stop_event = threading.Event()
         self._tmp_wav: Optional[str] = None
         self._piper_exec = self._resolve_piper_exec(cfg.piper_bin)
-        self._fallback_say = MacSayTTS(
-            TTSConfig(
-                backend="say",
-                lang=cfg.lang,
-                voice="",  # auto-pick language voice
-                rate=cfg.rate,
-                strip_emoji=cfg.strip_emoji,
-                strip_markdown=cfg.strip_markdown,
-                max_chars=cfg.max_chars,
-                piper_bin=cfg.piper_bin,
-                piper_model=cfg.piper_model,
-                cache_dir=cfg.cache_dir,
+        self._fallback_tts: TTSLike
+        if sys.platform == "darwin" and shutil.which("say") is not None:
+            self._fallback_tts = MacSayTTS(
+                TTSConfig(
+                    backend="say",
+                    lang=cfg.lang,
+                    voice="",  # auto-pick language voice
+                    rate=cfg.rate,
+                    strip_emoji=cfg.strip_emoji,
+                    strip_markdown=cfg.strip_markdown,
+                    max_chars=cfg.max_chars,
+                    piper_bin=cfg.piper_bin,
+                    piper_model=cfg.piper_model,
+                    cache_dir=cfg.cache_dir,
+                )
             )
-        )
+        else:
+            self._fallback_tts = NullTTS()
 
         if not cfg.piper_model:
             raise RuntimeError(
@@ -155,8 +174,6 @@ class PiperTTS:
             raise RuntimeError(
                 f"Piper backend requested, but binary not found: {cfg.piper_bin}"
             )
-        if shutil.which("afplay") is None:
-            raise RuntimeError("Piper backend requires macOS afplay.")
 
     def speak(self, text: str) -> None:
         text = _normalize_tts_text(text, self.cfg)
@@ -178,11 +195,11 @@ class PiperTTS:
         with self._lock:
             if self._piper_proc is not None and self._piper_proc.poll() is None:
                 return True
-            if self._player_proc is not None and self._player_proc.poll() is None:
+            if self._is_playing:
                 return True
             if self._worker is not None and self._worker.is_alive():
                 return True
-        return self._fallback_say.is_speaking()
+        return self._fallback_tts.is_speaking()
 
     def stop(self) -> None:
         with self._lock:
@@ -190,19 +207,11 @@ class PiperTTS:
 
     def _stop_locked(self) -> None:
         self._stop_event.set()
-
-        if self._player_proc is not None and self._player_proc.poll() is None:
-            try:
-                self._player_proc.terminate()
-                self._player_proc.wait(timeout=0.3)
-            except subprocess.TimeoutExpired:
-                try:
-                    self._player_proc.kill()
-                except Exception:  # noqa: BLE001
-                    pass
-            except Exception:  # noqa: BLE001
-                pass
-        self._player_proc = None
+        self._is_playing = False
+        try:
+            sd.stop()
+        except Exception:  # noqa: BLE001
+            pass
 
         if self._piper_proc is not None and self._piper_proc.poll() is None:
             try:
@@ -226,7 +235,7 @@ class PiperTTS:
                 pass
 
         # Do not keep stale fallback audio playing.
-        self._fallback_say.stop()
+        self._fallback_tts.stop()
 
     def _run_pipeline(self, text: str, stop_event: threading.Event) -> None:
         fd, wav_path = tempfile.mkstemp(prefix="piper_tts_", suffix=".wav", dir=self.cfg.cache_dir)
@@ -286,50 +295,25 @@ class PiperTTS:
                     self._speak_fallback(text, stop_event)
                 return
 
-            player_proc = subprocess.Popen(
-                ["afplay", wav_path],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-            )
             with self._lock:
                 if stop_event is not self._stop_event:
-                    try:
-                        player_proc.terminate()
-                    except Exception:  # noqa: BLE001
-                        pass
                     return
-                self._player_proc = player_proc
+                self._is_playing = True
 
-            while player_proc.poll() is None and not stop_event.is_set():
-                stop_event.wait(0.05)
-
-            afplay_stderr = ""
-            if stop_event.is_set() and player_proc.poll() is None:
-                try:
-                    player_proc.terminate()
-                    player_proc.wait(timeout=0.3)
-                except subprocess.TimeoutExpired:
-                    try:
-                        player_proc.kill()
-                    except Exception:  # noqa: BLE001
-                        pass
-                except Exception:  # noqa: BLE001
-                    pass
-            else:
-                _, afplay_stderr = player_proc.communicate()
+            ok, playback_err = self._play_wav(wav_path, stop_event)
 
             with self._lock:
-                if self._player_proc is player_proc:
-                    self._player_proc = None
+                self._is_playing = False
 
-            if not stop_event.is_set() and player_proc.returncode not in (0, None):
-                self._report_runtime_error("afplay", player_proc.returncode or 1, afplay_stderr)
+            if not ok and not stop_event.is_set():
+                self._report_runtime_error("playback", 1, playback_err)
                 self._speak_fallback(text, stop_event)
 
         finally:
             with self._lock:
                 tmp = self._tmp_wav
                 self._tmp_wav = None
+                self._is_playing = False
                 if self._worker is not None and threading.current_thread() is self._worker:
                     self._worker = None
 
@@ -342,8 +326,55 @@ class PiperTTS:
     def _speak_fallback(self, text: str, stop_event: threading.Event) -> None:
         if stop_event.is_set():
             return
-        print("[tts] Falling back to macOS say.", flush=True)
-        self._fallback_say.speak(text)
+        if isinstance(self._fallback_tts, NullTTS):
+            print("[tts] Fallback unavailable on this platform.", flush=True)
+            return
+        print("[tts] Falling back to system TTS.", flush=True)
+        self._fallback_tts.speak(text)
+
+    @staticmethod
+    def _play_wav(wav_path: str, stop_event: threading.Event) -> tuple[bool, str]:
+        try:
+            with wave.open(wav_path, "rb") as wf:
+                channels = wf.getnchannels()
+                sample_rate = wf.getframerate()
+                sample_width = wf.getsampwidth()
+                if channels <= 0 or sample_rate <= 0:
+                    return False, f"invalid wav format channels={channels} rate={sample_rate}"
+
+                dtype = PiperTTS._wav_dtype(sample_width)
+                dtype_np = np.dtype(dtype)
+                frames_per_chunk = 2048
+
+                with sd.OutputStream(
+                    samplerate=sample_rate,
+                    channels=channels,
+                    dtype=dtype,
+                    blocksize=frames_per_chunk,
+                ) as stream:
+                    while not stop_event.is_set():
+                        raw = wf.readframes(frames_per_chunk)
+                        if not raw:
+                            break
+
+                        chunk = np.frombuffer(raw, dtype=dtype_np)
+                        if channels > 1:
+                            chunk = chunk.reshape(-1, channels)
+                        stream.write(chunk)
+        except Exception as e:  # noqa: BLE001
+            return False, str(e)
+
+        return True, ""
+
+    @staticmethod
+    def _wav_dtype(sample_width: int) -> str:
+        if sample_width == 1:
+            return "uint8"
+        if sample_width == 2:
+            return "int16"
+        if sample_width == 4:
+            return "int32"
+        raise RuntimeError(f"unsupported wav sample width: {sample_width}")
 
     @staticmethod
     def _report_runtime_error(stage: str, code: int, stderr_text: str) -> None:
@@ -360,18 +391,29 @@ class PiperTTS:
         if not piper_bin:
             return None
 
-        direct = shutil.which(piper_bin)
-        if direct:
-            return direct
+        names = [piper_bin]
+        if os.name == "nt" and not piper_bin.lower().endswith(".exe"):
+            names.append(f"{piper_bin}.exe")
+
+        for name in names:
+            direct = shutil.which(name)
+            if direct:
+                return direct
 
         if os.path.isabs(piper_bin) and os.path.exists(piper_bin):
             return piper_bin
 
-        # Fallback: if running from venv python, look for sibling script.
-        py_bin_dir = os.path.dirname(sys.executable)
-        candidate = os.path.join(py_bin_dir, piper_bin)
-        if os.path.exists(candidate):
-            return candidate
+        search_roots = [os.path.dirname(sys.executable)]
+        meipass = getattr(sys, "_MEIPASS", "")
+        if meipass:
+            search_roots.append(str(meipass))
+
+        for root in search_roots:
+            for name in names:
+                for rel in (name, os.path.join("bin", name)):
+                    candidate = os.path.join(root, rel)
+                    if os.path.exists(candidate):
+                        return candidate
 
         return None
 
@@ -381,6 +423,10 @@ def build_tts(cfg: TTSConfig) -> TTSLike:
     if backend == "piper":
         return PiperTTS(cfg)
     if backend == "say":
+        if sys.platform != "darwin":
+            raise RuntimeError("VA_TTS_BACKEND=say is supported only on macOS. Use piper.")
+        if shutil.which("say") is None:
+            raise RuntimeError("macOS say not found in PATH.")
         return MacSayTTS(cfg)
     raise RuntimeError(f"Unknown TTS backend: {cfg.backend}")
 

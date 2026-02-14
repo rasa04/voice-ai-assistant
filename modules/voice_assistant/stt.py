@@ -240,7 +240,9 @@ class WhisperCppSTT:
         max_retries = len(params) + 1
         for _ in range(max_retries):
             try:
-                return self.model.transcribe(media, **params)
+                # Some bindings return a lazy iterator and can raise only on iteration.
+                # Materialize here so compatibility retries still work.
+                return list(self.model.transcribe(media, **params))
             except Exception as e:  # noqa: BLE001
                 bad_key = self._extract_unsupported_param(str(e), params)
                 if bad_key is None:
@@ -255,6 +257,10 @@ class WhisperCppSTT:
     @staticmethod
     def _extract_unsupported_param(err: str, params: dict[str, Any]) -> Optional[str]:
         m = re.search(r"has no attribute ['\"]([^'\"]+)['\"]", err)
+        if m and m.group(1) in params:
+            return m.group(1)
+
+        m = re.search(r"has no attribute ([A-Za-z_][A-Za-z0-9_]*)", err)
         if m and m.group(1) in params:
             return m.group(1)
 
