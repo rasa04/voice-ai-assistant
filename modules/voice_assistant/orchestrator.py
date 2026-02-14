@@ -19,6 +19,15 @@ class Utterance:
     pcm16: bytes
 
 
+def _norm_cmd(text: str) -> str:
+    t = text.lower().strip()
+    for ch in ["!", "?", ".", ",", "…", "—", "-", ":", ";", ")", "(", "[", "]", "{", "}", "\"", "'"]:
+        t = t.replace(ch, " ")
+    while "  " in t:
+        t = t.replace("  ", " ")
+    return t.strip()
+
+
 class AssistantWorker(threading.Thread):
     def __init__(
         self,
@@ -26,16 +35,19 @@ class AssistantWorker(threading.Thread):
         stt: WhisperCppSTT,
         llm: LMStudioChat,
         tts: MacSayTTS,
+        stop_event: threading.Event,
+        disable_tts: bool,
     ):
         super().__init__(daemon=True)
         self.utter_q = utter_q
         self.stt = stt
         self.llm = llm
         self.tts = tts
-        self._stop = threading.Event()
+        self.stop_event = stop_event
+        self.disable_tts = disable_tts
 
     def run(self) -> None:
-        while not self._stop.is_set():
+        while not self.stop_event.is_set():
             try:
                 utt = self.utter_q.get(timeout=0.2)
             except queue.Empty:
@@ -46,34 +58,38 @@ class AssistantWorker(threading.Thread):
                 if not text:
                     continue
 
-                print(f"\n🧏  Ты сказал: {text}\n")
+                print(f"\n🧏  Ты сказал: {text}\n", flush=True)
 
-                # simple voice commands
-                if text.lower() in {"стоп", "stop"}:
+                cmd = _norm_cmd(text)
+
+                # команды делаем "безопасными": только с префиксом "ассистент"
+                if cmd in {"ассистент стоп", "ассистент стопни"}:
                     self.tts.stop()
                     continue
-                if text.lower() in {"выход", "пока", "exit", "quit"}:
+
+                if cmd in {"ассистент выход", "ассистент завершись", "ассистент выключись"}:
                     self.tts.stop()
-                    os._exit(0)  # fast exit for MVP
+                    self.stop_event.set()
+                    return
 
                 self.llm.add_user(text)
                 print("🤖  Ответ: ", end="", flush=True)
                 answer = self.llm.reply()
                 self.llm.add_assistant(answer)
 
-                if answer:
+                if answer and not self.disable_tts:
+                    print("🔊  Озвучиваю...", flush=True)
                     self.tts.speak(answer)
 
             except Exception as e:  # noqa: BLE001
-                print(f"\n[worker error] {e}\n")
-
-    def stop(self) -> None:
-        self._stop.set()
+                print(f"\n[worker error] {e}\n", flush=True)
 
 
 def main() -> None:
     cfg = Config()
     os.makedirs(cfg.cache_dir, exist_ok=True)
+
+    disable_tts = os.getenv("VA_DISABLE_TTS", "0") == "1"
 
     frame_samples = int(cfg.sample_rate * (cfg.frame_ms / 1000.0))
 
@@ -116,36 +132,47 @@ def main() -> None:
     tts = MacSayTTS(TTSConfig(voice=cfg.tts_voice, rate=cfg.tts_rate))
 
     utter_q: "queue.Queue[Utterance]" = queue.Queue(maxsize=20)
-    worker = AssistantWorker(utter_q=utter_q, stt=stt, llm=llm, tts=tts)
+    stop_event = threading.Event()
+
+    worker = AssistantWorker(
+        utter_q=utter_q,
+        stt=stt,
+        llm=llm,
+        tts=tts,
+        stop_event=stop_event,
+        disable_tts=disable_tts,
+    )
     worker.start()
 
     print(
         "\nГотово. Говори в микрофон.\n"
-        "- Команда: «стоп» — прервать озвучку\n"
-        "- Команда: «выход» — завершить\n"
+        "- Команда: «ассистент стоп» — прервать озвучку\n"
+        "- Команда: «ассистент выход» — завершить\n",
+        flush=True,
     )
 
     try:
-        while True:
+        while not stop_event.is_set():
             frame = mic.queue.get()
             events = vad.process_frame(frame.pcm16)
 
             for et, payload in events:
                 if et == "speech_start":
-                    # barge-in: if you start speaking while TTS is playing, stop it
+                    # barge-in: если ты начал говорить — прерываем TTS
                     if tts.is_speaking():
                         tts.stop()
+
                 elif et == "utterance" and payload:
                     try:
                         utter_q.put_nowait(Utterance(pcm16=payload))
                     except queue.Full:
-                        # drop utterance to keep responsiveness
                         pass
 
             time.sleep(0.0)
+
     except KeyboardInterrupt:
-        print("\nОстановлено.")
+        print("\nОстановлено.", flush=True)
     finally:
-        worker.stop()
+        stop_event.set()
         mic.stop()
         tts.stop()
